@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# tmux-worktree: Manage git worktrees with tmux integration
+# Each worktree gets its own tmux window for seamless branch switching
+
+set -e
+
+SCRIPT_NAME="tmux-worktree"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME <command> [options]
+
+Commands:
+    new <branch> [path]    Create a new worktree and open in tmux window
+    list                   List all worktrees with their tmux windows
+    switch <branch>        Switch to worktree's tmux window (or create if needed)
+    pick                   Interactive fuzzy picker to switch worktrees (fzf)
+    remove <branch>        Remove worktree and close its tmux window
+    menu                   Interactive menu (for tmux popup)
+
+Examples:
+    $SCRIPT_NAME new feature/login
+    $SCRIPT_NAME switch main
+    $SCRIPT_NAME remove feature/old-branch
+EOF
+}
+
+get_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || {
+        echo -e "${RED}Error: Not in a git repository${NC}" >&2
+        exit 1
+    }
+}
+
+get_bare_or_main_worktree() {
+    local root
+    root=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [[ "$root" == *".git" ]]; then
+        dirname "$root"
+    else
+        echo "$root"
+    fi
+}
+
+sanitize_window_name() {
+    # Convert branch name to valid tmux window name
+    echo "$1" | sed 's/[^a-zA-Z0-9_-]/-/g' | sed 's/--*/-/g'
+}
+
+get_worktree_path() {
+    local branch="$1"
+    local repo_root
+    repo_root=$(get_repo_root)
+    local worktrees_dir="${repo_root}/.worktrees"
+
+    # Check if worktree already exists
+    git worktree list --porcelain | grep -A2 "^worktree" | while read -r line; do
+        if [[ "$line" == "branch refs/heads/$branch" ]]; then
+            git worktree list --porcelain | grep -B2 "branch refs/heads/$branch" | grep "^worktree" | cut -d' ' -f2
+            return
+        fi
+    done
+
+    # Return default path for new worktree
+    echo "${worktrees_dir}/${branch}"
+}
+
+cmd_new() {
+    local branch="$1"
+    local custom_path="$2"
+
+    if [[ -z "$branch" ]]; then
+        echo -e "${RED}Error: Branch name required${NC}" >&2
+        usage
+        exit 1
+    fi
+
+    local repo_root
+    repo_root=$(get_repo_root)
+    local worktrees_dir="${repo_root}/.worktrees"
+    local worktree_path="${custom_path:-${worktrees_dir}/${branch}}"
+    local window_name
+    window_name=$(sanitize_window_name "$branch")
+
+    # Create worktrees directory if it doesn't exist
+    mkdir -p "$worktrees_dir"
+
+    # Check if branch exists locally or remotely
+    if git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+        echo -e "${BLUE}Creating worktree for existing branch: $branch${NC}"
+        git worktree add "$worktree_path" "$branch"
+    elif git show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+        echo -e "${BLUE}Creating worktree tracking remote branch: $branch${NC}"
+        git worktree add "$worktree_path" "$branch"
+    else
+        echo -e "${BLUE}Creating worktree with new branch: $branch${NC}"
+        git worktree add -b "$branch" "$worktree_path"
+    fi
+
+    # Copy .env* files from main worktree (recursively, preserving paths)
+    local main_worktree
+    main_worktree=$(git worktree list | head -1 | awk '{print $1}')
+    local env_files_copied=()
+    while IFS= read -r -d '' env_file; do
+        # Get relative path from main worktree
+        local rel_path="${env_file#$main_worktree/}"
+        local dest_dir="$worktree_path/$(dirname "$rel_path")"
+        # Create destination directory if needed
+        mkdir -p "$dest_dir"
+        # Copy file (preserve symlinks with -P)
+        cp -P "$env_file" "$worktree_path/$rel_path"
+        env_files_copied+=("$rel_path")
+    done < <(find "$main_worktree" \( -name "node_modules" -o -name ".worktrees" -o -name ".git" \) -prune -o \( -name ".env*" -type f -print0 \) -o \( -name ".env*" -type l -print0 \) 2>/dev/null)
+    if [[ ${#env_files_copied[@]} -gt 0 ]]; then
+        echo -e "${GREEN}Copied env files:${NC}"
+        for f in "${env_files_copied[@]}"; do
+            echo -e "  ${YELLOW}$f${NC}"
+        done
+    fi
+
+    # Install npm dependencies
+    if [[ -f "$worktree_path/package.json" ]]; then
+        echo -e "${BLUE}Installing npm dependencies...${NC}"
+        (cd "$worktree_path" && npm i)
+    fi
+
+    # Create new tmux window for this worktree
+    if [[ -n "$TMUX" ]]; then
+        tmux new-window -n "$window_name" -c "$worktree_path"
+        tmux select-window -t "$window_name"
+        echo -e "${GREEN}Created worktree and tmux window: $window_name${NC}"
+    else
+        echo -e "${YELLOW}Not in tmux. Worktree created at: $worktree_path${NC}"
+        echo -e "Run: cd $worktree_path"
+    fi
+}
+
+cmd_list() {
+    echo -e "${BLUE}Git Worktrees:${NC}"
+    echo ""
+
+    git worktree list | while read -r line; do
+        local path branch
+        path=$(echo "$line" | awk '{print $1}')
+        branch=$(echo "$line" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+
+        local window_name
+        window_name=$(sanitize_window_name "$branch")
+
+        # Check if tmux window exists
+        local window_exists=""
+        if [[ -n "$TMUX" ]]; then
+            if tmux list-windows -F '#{window_name}' | grep -q "^${window_name}$"; then
+                window_exists="${GREEN}[tmux: $window_name]${NC}"
+            fi
+        fi
+
+        echo -e "  ${YELLOW}$branch${NC} -> $path $window_exists"
+    done
+}
+
+cmd_switch() {
+    local branch="$1"
+
+    if [[ -z "$branch" ]]; then
+        echo -e "${RED}Error: Branch name required${NC}" >&2
+        exit 1
+    fi
+
+    local window_name
+    window_name=$(sanitize_window_name "$branch")
+
+    # Check if worktree exists
+    local worktree_path
+    worktree_path=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
+
+    if [[ -z "$worktree_path" ]]; then
+        echo -e "${YELLOW}Worktree for '$branch' doesn't exist. Creating...${NC}"
+        cmd_new "$branch"
+        return
+    fi
+
+    if [[ -n "$TMUX" ]]; then
+        # Check if window exists
+        if tmux list-windows -F '#{window_name}' | grep -q "^${window_name}$"; then
+            tmux select-window -t "$window_name"
+            echo -e "${GREEN}Switched to window: $window_name${NC}"
+        else
+            # Create window for existing worktree
+            tmux new-window -n "$window_name" -c "$worktree_path"
+            tmux select-window -t "$window_name"
+            echo -e "${GREEN}Created window for worktree: $window_name${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Not in tmux. Worktree is at: $worktree_path${NC}"
+    fi
+}
+
+cmd_pick() {
+    # Interactive fuzzy picker for quick worktree switching
+    if ! command -v fzf &> /dev/null; then
+        echo -e "${RED}Error: fzf not installed. Run: brew install fzf${NC}" >&2
+        exit 1
+    fi
+
+    # Format: "branch -> path" for display, extract branch after selection
+    local selection
+    selection=$(git worktree list | while read -r line; do
+        local path branch
+        path=$(echo "$line" | awk '{print $1}')
+        branch=$(echo "$line" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+        # Show branch prominently, then path
+        echo -e "$branch\t$path"
+    done | fzf --prompt="Switch to worktree: " \
+               --height=40% \
+               --layout=reverse \
+               --delimiter='\t' \
+               --with-nth=1 \
+               --preview='echo "Path: {2}"' \
+               --preview-window=down:1:wrap)
+
+    if [[ -n "$selection" ]]; then
+        local branch
+        branch=$(echo "$selection" | cut -f1)
+        cmd_switch "$branch"
+    fi
+}
+
+cmd_pick_remove() {
+    # Interactive fuzzy picker for removing worktrees
+    if ! command -v fzf &> /dev/null; then
+        echo -e "${RED}Error: fzf not installed. Run: brew install fzf${NC}" >&2
+        exit 1
+    fi
+
+    # Exclude the main worktree (first entry) from removal options
+    local selection
+    selection=$(git worktree list | tail -n +2 | while read -r line; do
+        local path branch
+        path=$(echo "$line" | awk '{print $1}')
+        branch=$(echo "$line" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+        echo -e "$branch\t$path"
+    done | fzf --prompt="Remove worktree: " \
+               --height=40% \
+               --layout=reverse \
+               --delimiter='\t' \
+               --with-nth=1 \
+               --preview='echo "Path: {2}"' \
+               --preview-window=down:1:wrap)
+
+    if [[ -n "$selection" ]]; then
+        local branch
+        branch=$(echo "$selection" | cut -f1)
+        echo -e "${YELLOW}Removing worktree: $branch${NC}"
+        cmd_remove "$branch"
+    fi
+}
+
+cmd_remove() {
+    local branch="$1"
+
+    if [[ -z "$branch" ]]; then
+        echo -e "${RED}Error: Branch name required${NC}" >&2
+        exit 1
+    fi
+
+    local window_name
+    window_name=$(sanitize_window_name "$branch")
+
+    # Find worktree path
+    local worktree_path
+    worktree_path=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
+
+    if [[ -z "$worktree_path" ]]; then
+        echo -e "${RED}Error: No worktree found for branch '$branch'${NC}" >&2
+        exit 1
+    fi
+
+    # Close tmux window if it exists
+    if [[ -n "$TMUX" ]]; then
+        if tmux list-windows -F '#{window_name}' | grep -q "^${window_name}$"; then
+            tmux kill-window -t "$window_name" 2>/dev/null || true
+            echo -e "${BLUE}Closed tmux window: $window_name${NC}"
+        fi
+    fi
+
+    # Remove the worktree
+    git worktree remove "$worktree_path" --force
+    echo -e "${GREEN}Removed worktree: $worktree_path${NC}"
+}
+
+cmd_menu() {
+    # Interactive menu using fzf if available
+    if ! command -v fzf &> /dev/null; then
+        echo "fzf not installed. Showing list instead."
+        cmd_list
+        return
+    fi
+
+    local action
+    action=$(echo -e "new\nswitch\nlist\nremove" | fzf --prompt="Worktree action: " --height=10)
+
+    case "$action" in
+        new)
+            local branch
+            branch=$(echo "" | fzf --prompt="New branch name: " --print-query | head -1)
+            [[ -n "$branch" ]] && cmd_new "$branch"
+            ;;
+        switch)
+            local branch
+            branch=$(git worktree list | tail -n +1 | fzf --prompt="Switch to: " | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+            [[ -n "$branch" ]] && cmd_switch "$branch"
+            ;;
+        list)
+            cmd_list
+            ;;
+        remove)
+            local branch
+            branch=$(git worktree list | tail -n +2 | fzf --prompt="Remove: " | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+            [[ -n "$branch" ]] && cmd_remove "$branch"
+            ;;
+    esac
+}
+
+# Main command dispatcher
+case "${1:-}" in
+    new)
+        shift
+        cmd_new "$@"
+        ;;
+    list|ls)
+        cmd_list
+        ;;
+    switch|sw)
+        shift
+        cmd_switch "$@"
+        ;;
+    pick|p)
+        cmd_pick
+        ;;
+    pick-remove|pr)
+        cmd_pick_remove
+        ;;
+    remove|rm)
+        shift
+        cmd_remove "$@"
+        ;;
+    menu)
+        cmd_menu
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        if [[ -n "$1" ]]; then
+            echo -e "${RED}Unknown command: $1${NC}" >&2
+        fi
+        usage
+        exit 1
+        ;;
+esac
