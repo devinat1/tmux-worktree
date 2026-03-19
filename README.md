@@ -5,9 +5,14 @@ Tmux configuration with git worktree integration.
 ## Setup
 
 ```bash
+# Tmux
 ln -s ~/Desktop/projects/tmux-worktree/tmux.conf ~/.tmux.conf
 ln -s ~/Desktop/projects/tmux-worktree/bin/tmux-worktree ~/.local/bin/tmux-worktree
 tmux source-file ~/.tmux.conf
+
+# Neovim
+mkdir -p ~/.config/nvim
+ln -s ~/Desktop/projects/tmux-worktree/init.lua ~/.config/nvim/init.lua
 ```
 
 ## What it does
@@ -78,3 +83,12 @@ tmux-worktree remove <branch>   # Remove worktree
 | Reload config | `r` |
 | Copy mode (vim) | `[` or `Escape` |
 | Paste | `]` |
+
+## Neovim
+
+Plugins are managed by [lazy.nvim](https://github.com/folke/lazy.nvim) and install automatically on first launch.
+
+| Action | Keybinding |
+|--------|------------|
+| Find files | `Ctrl+P` |
+| Live grep | `Ctrl+Shift+F` |
