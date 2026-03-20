@@ -6,7 +6,6 @@
 -- ─────────────────────────────────────────────────────────────
 
 vim.opt.number = true
-vim.opt.relativenumber = true
 
 -- ─────────────────────────────────────────────────────────────
 -- Bootstrap lazy.nvim
@@ -37,4 +36,22 @@ require("lazy").setup({
       { "<C-S-f>", "<cmd>Telescope live_grep<cr>", desc = "Live grep" },
     },
   },
+})
+
+-- ─────────────────────────────────────────────────────────────
+-- Auto-format Go files on save
+-- ─────────────────────────────────────────────────────────────
+
+vim.api.nvim_create_autocmd("BufWritePre", {
+  pattern = "*.go",
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n"
+    local result = vim.fn.system("gofmt", content)
+    if vim.v.shell_error == 0 then
+      local lines = vim.split(result, "\n")
+      if lines[#lines] == "" then table.remove(lines) end
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    end
+  end,
 })
